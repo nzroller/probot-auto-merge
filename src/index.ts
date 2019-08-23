@@ -6,12 +6,19 @@ import { RepositoryWorkers } from './repository-workers'
 import sentryStream from 'bunyan-sentry-stream'
 import { RepositoryReference, PullRequestReference } from './github-models'
 import myAppId from './myappid'
+import { Router } from 'express'
+import { GitHubAPI } from 'probot/lib/github'
+import { queryPullRequest } from './pull-request-query'
+import bunyan from 'bunyan'
+import bodyParser = require('body-parser')
+import { wrapLogger } from 'probot/lib/wrap-logger'
+import { PassThrough } from 'stream'
 import { flatten } from './utils'
 
 async function getWorkerContext (options: {app: Application, context: Context, installationId: number}): Promise<WorkerContext> {
   const { app, context, installationId } = options
   const config = await loadConfig(context)
-  const log = app.log
+  const log = context.log
   const createGitHubAPI = async () => {
     return app.auth(installationId, log)
   }
@@ -120,7 +127,8 @@ export = (app: Application) => {
     'pull_request.reopened',
     'pull_request_review.submitted',
     'pull_request_review.edited',
-    'pull_request_review.dismissed'
+    'pull_request_review.dismissed',
+    'pull_request.trigger'
   ], async context => {
     await handlePullRequests(app, context, context.payload.installation.id, {
       owner: context.payload.repository.owner.login,
@@ -169,5 +177,141 @@ export = (app: Application) => {
       owner: context.payload.repository.owner.login,
       repo: context.payload.repository.name
     }, context.payload.check_suite.pull_requests.map((pullRequest: any) => pullRequest.number))
+  })
+
+  const router: Router = app.route('/api')
+  router.use((req, res, next) => {
+    if (req.query.token !== process.env.DEBUG_TOKEN) {
+      return res.status(403).send('')
+    }
+    return next()
+  })
+  router.use(bodyParser())
+  router.get('/queue', (req, res) => {
+    const result = Object.entries(repositoryWorkers.getRepositoryWorkers())
+      .map(([name, worker]) => {
+        const workerQueue = {
+          current: worker.getCurrentTask(),
+          queue: worker.getQueuedTasks()
+        }
+        return [name, workerQueue] as [string, typeof workerQueue]
+      })
+      .reduce((result, [name, worker]) => ({ ...result, [name]: worker }), {})
+    res.json(result)
+  })
+  router.get('/trigger', async (req, res) => {
+    const owner = req.query.owner
+    const repo = req.query.repo
+    const pullRequestNumber = parseInt(req.query.pullRequestNumber, 10)
+    app.auth()
+      .then(async (appOctokit: GitHubAPI) => {
+        const { data: installation } = await appOctokit.apps.findRepoInstallation({ owner, repo })
+        const event: any = {
+          id: '1',
+          name: 'pull_request',
+          payload: {
+            action: 'trigger',
+            installation,
+            repository: {
+              owner: {
+                login: owner
+              },
+              name: repo
+            },
+            pull_request: {
+              number: pullRequestNumber
+            }
+          }
+        }
+        await app.receive(event)
+        res.json({ status: 'ok' })
+      })
+      .catch(err => {
+        res.status(500).json({ status: 'error', error: err.toString() })
+      })
+  })
+
+  router.get('/run', async (req, res) => {
+    const owner = req.query.owner
+    const repo = req.query.repo
+    const pullRequestNumber = parseInt(req.query.pullRequestNumber, 10)
+    app.auth()
+      .then(async (appOctokit: GitHubAPI) => {
+        const { data: installation } = await appOctokit.apps.findRepoInstallation({ owner, repo })
+        const github = await app.auth(installation.id)
+        const event: any = {
+          id: '1',
+          name: 'pull_request',
+          payload: {
+            action: 'trigger',
+            installation,
+            repository: {
+              owner: {
+                login: owner
+              },
+              name: repo
+            },
+            pull_request: {
+              number: pullRequestNumber
+            }
+          }
+        }
+
+        const logStream = new PassThrough({
+          autoDestroy: true,
+          allowHalfOpen: true,
+          emitClose: true
+        })
+        logStream.pipe(res)
+        const log = wrapLogger(bunyan.createLogger({
+          name: 'http',
+          stream: logStream,
+          level: 'debug'
+        }))
+
+        log.info('Started logging')
+
+        const context = new Context(event, github, log)
+
+        await handlePullRequests(app, context, installation.id, { owner, repo }, [pullRequestNumber])
+
+        req.connection.once('close', () => {
+          res.end()
+        })
+      })
+      .catch(err => {
+        res.status(500).json({ status: 'error', error: err.toString() })
+      })
+  })
+
+  router.get('/query', async (req, res) => {
+    const owner = req.query.owner
+    const repo = req.query.repo
+    const pullRequestNumber = parseInt(req.query.pullRequestNumber, 10)
+    app.auth()
+      .then(async (appOctokit: GitHubAPI) => {
+        const { data: installation } = await appOctokit.apps.findRepoInstallation({ owner, repo })
+        const repoOctokit = await app.auth(installation.id)
+        const result = await queryPullRequest(repoOctokit, { owner, repo, number: pullRequestNumber })
+        res.json(result)
+      })
+      .catch(err => {
+        res.status(500).json({ status: 'error', error: err.toString() })
+      })
+  })
+
+  router.post('/graphql', async (req, res) => {
+    const owner = req.query.owner
+    const repo = req.query.repo
+    app.auth()
+      .then(async (appOctokit: GitHubAPI) => {
+        const { data: installation } = await appOctokit.apps.findRepoInstallation({ owner, repo })
+        const repoOctokit = await app.auth(installation.id)
+        const response = await repoOctokit.query(req.body.query, req.body.variables, { 'Accept': req.headers.accept, ...req.body.headers })
+        return res.json(response)
+      })
+      .catch(err => {
+        res.status(500).json({ status: 'error', error: err.toString() })
+      })
   })
 }
